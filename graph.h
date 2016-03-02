@@ -46,6 +46,7 @@ ciss_graph* ciss_graph_create();
 ciss_graph* ciss_graph_malloc();
 
 ciss_graph_node* ciss_graph_find_node(ciss_graph*, int);
+ciss_graph_node* ciss_graph_nth_node(ciss_graph*, size_t);
 void ciss_graph_append_node(ciss_graph*, ciss_graph_node*);
 size_t ciss_graph_node_number(ciss_graph*);
 ciss_graph_node* ciss_graph_ensure_node(ciss_graph*, int);

@@ -17,7 +17,7 @@
 #include "linked_list.h"
 #include "path.h"
 
-ciss_kleene_element* build_kleene(ciss_graph* graph) {
+ciss_kleene_element** build_kleene(ciss_graph* graph) {
   size_t nb_nodes;
   size_t i, j, k;
   ciss_graph_node* node_i;
@@ -34,7 +34,7 @@ ciss_kleene_element* build_kleene(ciss_graph* graph) {
     node_j = graph->nodes;
     for (j = 0; j < nb_nodes; j++, node_j = node_j->next) {
       ciss_kleene_element_list* list = NULL;
-      for (arc = node_i->incoming; arc != NULL; arc = arc->next) {
+      for (arc = node_i->outgoing; arc != NULL; arc = arc->next) {
         if (arc->target == node_j) {
           list = ciss_kleene_element_list_append(list, ciss_kleene_element_create_single(arc));
         }
@@ -57,16 +57,18 @@ ciss_kleene_element* build_kleene(ciss_graph* graph) {
     for (i = 0; i < nb_nodes; i++, node_i = node_i->next) {
       node_j = graph->nodes;
       for (j = 0; j < nb_nodes; j++, node_j = node_j->next) {
-        ciss_kleene_element* star_element = ciss_kleene_element_create_star(previous_step[k * nb_nodes + k]);
+        ciss_kleene_element* star_element = ciss_kleene_element_create_star(
+              ciss_kleene_element_clone(previous_step[k * nb_nodes + k]));
 
         ciss_kleene_element_list* list_1 = (ciss_kleene_element_list*) malloc(sizeof(ciss_kleene_element_list));
         ciss_kleene_element_list* list_2 = (ciss_kleene_element_list*) malloc(sizeof(ciss_kleene_element_list));
         ciss_kleene_element_list* list_3 = (ciss_kleene_element_list*) malloc(sizeof(ciss_kleene_element_list));
         list_1->next = list_2;
         list_2->next = list_3;
-        list_1->element = previous_step[i * nb_nodes + k];
+        list_3->next = 0;
+        list_1->element = ciss_kleene_element_clone(previous_step[i * nb_nodes + k]);
         list_2->element = star_element;
-        list_3->element = previous_step[k * nb_nodes + j];
+        list_3->element = ciss_kleene_element_clone(previous_step[k * nb_nodes + j]);
 
         ciss_kleene_element* seq_element = ciss_kleene_element_create_list(list_1, LIST_SEQUENCE);
 
@@ -74,19 +76,25 @@ ciss_kleene_element* build_kleene(ciss_graph* graph) {
         ciss_kleene_element_list* alist_2 = (ciss_kleene_element_list*) malloc(sizeof(ciss_kleene_element_list));
         alist_1->next = alist_2;
         alist_1->element = seq_element;
-        alist_2->element = previous_step[i * nb_nodes + j];
+        alist_2->element = ciss_kleene_element_clone(previous_step[i * nb_nodes + j]);
+        alist_2->next = 0;
 
         ciss_kleene_element* element = ciss_kleene_element_create_list(alist_1, LIST_ALTERNATIVES);
+        ciss_kleene_element_simplify(element);
         current_step[i * nb_nodes + j] = element;
       }
     }
-
+    // clean all the elements of the previous step (they were already cloned wherever necessary)
+    for (i = 0; i < nb_nodes; ++i) {
+      for (j = 0; j < nb_nodes; ++j) {
+        ciss_kleene_element_free(previous_step[i * nb_nodes + j]);
+      }
+    }
     memcpy(previous_step, current_step, sizeof(ciss_kleene_element*) * nb_nodes * nb_nodes);
   }
 
-  free(previous_step);
   free(current_step);
-  return NULL;
+  return previous_step;
 }
 
 // isl relation processing
@@ -166,8 +174,12 @@ isl_union_map* ciss_relation_compose_kleene_recurse(isl_ctx* ctx, ciss_kleene_el
     break;
   case STAR:
     composed_umap = ciss_relation_compose_kleene_recurse(ctx, head->star);
-    if (composed_umap != NULL)
+    if (composed_umap != NULL) {
       composed_umap = isl_union_map_transitive_closure(composed_umap, &exact);
+      if (!exact) {
+        fprintf(stderr, "[ciss] Could not construct exact transitive closure.\n");
+      }
+    }
     break;
   case EMPTY:
     composed_umap = NULL;
@@ -261,10 +273,8 @@ void ciss_graph_path_list_print(ciss_graph_path_list* list) {
   }
 }
 
-osl_relation_p ciss_split_by_path(osl_relation_p source_domain, osl_relation_p target_domain, ciss_graph_path* path) { // relation = scattered domain or domain?
-  // we need to work on scattered domains to check for chunks in a transformed scop, but modify the original domain.
-  isl_ctx* ctx = isl_ctx_alloc();
-  isl_union_map* dependence_umap = ciss_relation_compose_list_isl(path, ctx);
+osl_relation_p ciss_process_dependence(osl_relation_p target_domain, osl_relation_p source_domain,
+                                       isl_union_map* dependence_umap, isl_ctx* ctx) {
   isl_union_map* source_domain_umap = osl_relation_to_isl_union_map(ctx, source_domain);
   dependence_umap = isl_union_map_apply_range(source_domain_umap, dependence_umap);
 
@@ -282,6 +292,24 @@ osl_relation_p ciss_split_by_path(osl_relation_p source_domain, osl_relation_p t
   osl_relation_p first = isl_union_map_to_osl_relation(isl_union_map_from_range(intersection));
   osl_relation_p second = isl_union_map_to_osl_relation(isl_union_map_from_range(complement));
   LL_APPEND(osl_relation_t, first, second);
+
+  return first;
+}
+
+osl_relation_p ciss_split_by_path(osl_relation_p source_domain, osl_relation_p target_domain, ciss_graph_path* path) { // relation = scattered domain or domain?
+  // we need to work on scattered domains to check for chunks in a transformed scop, but modify the original domain.
+  isl_ctx* ctx = isl_ctx_alloc();
+  isl_union_map* dependence_umap = ciss_relation_compose_list_isl(path, ctx);
+  osl_relation_p first = ciss_process_dependence(target_domain, source_domain, dependence_umap, ctx);
+
+  isl_ctx_free(ctx);
+  return first;
+}
+
+osl_relation_p ciss_split_by_kleene(osl_relation_p source_domain, osl_relation_p target_domain, ciss_kleene_element* head) {
+  isl_ctx* ctx = isl_ctx_alloc();
+  isl_union_map* dependence_umap = ciss_relation_compose_kleene_recurse(ctx, head);
+  osl_relation_p first = ciss_process_dependence(target_domain, source_domain, dependence_umap, ctx);
 
   isl_ctx_free(ctx);
   return first;
@@ -312,11 +340,7 @@ osl_statement_p ciss_osl_statement_find_label(osl_statement_p stmt, int label) {
   return stmt;
 }
 
-void ciss_path(osl_scop_p scop) {
-  candl_options_p options = candl_options_malloc();
-  options->fullcheck = 1;
-  candl_scop_usr_init(scop);
-
+ciss_labeled_domain* ciss_labeled_domain_list(osl_scop_p scop) {
   ciss_labeled_domain* domains = NULL;
   ciss_labeled_domain* domains_ptr;
   osl_statement_p stmt;
@@ -335,6 +359,16 @@ void ciss_path(osl_scop_p scop) {
       domains_ptr = domain;
     }
   }
+
+  return domains;
+}
+
+void ciss_path(osl_scop_p scop) {
+  candl_options_p options = candl_options_malloc();
+  options->fullcheck = 1;
+  candl_scop_usr_init(scop);
+
+  ciss_labeled_domain* domains = ciss_labeled_domain_list(scop);
 
   osl_dependence_p dependence = candl_dependence(scop, options);
   ciss_graph* graph = ciss_graph_construct(dependence);
@@ -360,21 +394,81 @@ void ciss_path(osl_scop_p scop) {
   candl_options_free(options);
 }
 
-int main() {
-  osl_scop_p scop = osl_scop_read(stdin);
+void ciss_kleene_path(osl_scop_p scop) {
   candl_options_p options = candl_options_malloc();
   options->fullcheck = 1;
   candl_scop_usr_init(scop);
+
+  ciss_labeled_domain* domains = ciss_labeled_domain_list(scop);
   osl_dependence_p dependence = candl_dependence(scop, options);
-
   ciss_graph* graph = ciss_graph_construct(dependence);
-  ciss_graph_path_list* list = ciss_graph_all_paths(graph);
+  ciss_kleene_element** kleene_table = build_kleene(graph);
 
-//  ciss_graph_path_list_print(list);
-  ciss_path(scop);
+  size_t nb_nodes, i, j;
+  LL_SIZE(ciss_graph_node, graph->nodes, nb_nodes);
+  for (i = 0; i < nb_nodes; i++) {
+    for (j = 0; j < nb_nodes; j++) {
+      ciss_kleene_element* dependence_chain;
+      dependence_chain = kleene_table[i * nb_nodes + j];
+      if (dependence_chain) {
+        printf("%zu -> %zu: ", i, j);
+        ciss_kleene_element_print(stdout, dependence_chain);
+        printf("\n");
+
+        ciss_relation_compose_kleene(dependence_chain);
+        ciss_labeled_domain* target_labeled_domain = ciss_labeled_domain_find(domains,
+                                                                              ciss_graph_nth_node(graph, j)->label);
+        osl_relation_p source_domain = ciss_osl_statement_find_label(scop->statement,
+                                                                     ciss_graph_nth_node(graph, i)->label)->domain;
+        target_labeled_domain->domain = ciss_split_by_kleene(source_domain, target_labeled_domain->domain, dependence_chain);
+      }
+    }
+  }
+  for (i = 0; i < nb_nodes; ++i) {
+    for (j = 0; j < nb_nodes; ++j) {
+      ciss_kleene_element_free(kleene_table[i * nb_nodes + j]);
+    }
+  }
 
   candl_scop_usr_cleanup(scop);
   candl_options_free(options);
+}
+
+void test() {
+  ciss_kleene_element* empty = ciss_kleene_element_create_empty();
+  ciss_kleene_element_list* inner_list = ciss_kleene_element_list_create(empty);
+  ciss_kleene_element* inner = ciss_kleene_element_create_list(inner_list, LIST_ALTERNATIVES);
+  ciss_kleene_element_list* outer_list = ciss_kleene_element_list_create(inner);
+  ciss_kleene_element* outer = ciss_kleene_element_create_list(outer_list, LIST_ALTERNATIVES);
+
+  ciss_kleene_element_simplify(outer);
+
+  ciss_kleene_element_print(stdout, outer);
+  fprintf(stdout, "\n");
+  fflush(stdout);
+
+}
+
+int main() {
+//  test();
+//  return 0;
+
+  osl_scop_p scop = osl_scop_read(stdin);
+  ciss_kleene_path(scop);
+//  ciss_path(scop);
+
+//  candl_options_p options = candl_options_malloc();
+//  options->fullcheck = 1;
+//  candl_scop_usr_init(scop);
+//  osl_dependence_p dependence = candl_dependence(scop, options);
+
+//  ciss_graph* graph = ciss_graph_construct(dependence);
+//  ciss_graph_path_list* list = ciss_graph_all_paths(graph);
+
+//  ciss_graph_path_list_print(list);
+
+//  candl_scop_usr_cleanup(scop);
+//  candl_options_free(options);
   osl_scop_free(scop);
   return 0;
 }

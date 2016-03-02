@@ -17,6 +17,7 @@ ciss_graph_node* ciss_graph_node_create(int label) {
   node->outgoing = NULL;
   node->incoming = NULL;
   node->next = NULL;
+  node->domain_ptr = NULL;
   return node;
 }
 
@@ -94,6 +95,15 @@ ciss_graph_node* ciss_graph_find_node(ciss_graph* graph, int label) {
       return node;
   }
   return NULL;
+}
+
+ciss_graph_node* ciss_graph_nth_node(ciss_graph* graph, size_t index) {
+  ciss_graph_node* node = graph->nodes;
+  while (index != 0) {
+    node = node->next;
+    --index;
+  }
+  return node;
 }
 
 void ciss_graph_append_node(ciss_graph* graph, ciss_graph_node* node) {
