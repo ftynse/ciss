@@ -140,3 +140,127 @@ osl_relation_p isl_union_map_to_osl_relation(__isl_take isl_union_map* umap) {
   isl_union_map_free(umap);
   return relation;
 }
+
+static int id_list_index_of(__isl_keep struct isl_id_list* id_list, __isl_keep isl_id* id) {
+  int i, n = isl_id_list_n_id(id_list);
+  for (i = 0; i < n; ++i) {
+    isl_id *lid = isl_id_list_get_id(id_list, i);
+    if (lid == id) {
+      isl_id_free(lid);
+      return i;
+    }
+    isl_id_free(lid);
+  }
+  return -1;
+}
+
+struct collect_accesses_data {
+  osl_scop_p scop;
+  osl_statement_p stmt;
+  isl_id_list* id_list;
+};
+
+static isl_stat collect_accesses(__isl_take isl_map* m, void* user) {
+  osl_relation_p relation;
+  osl_relation_list_p node;
+  isl_id* array_id;
+  int array_index;
+  struct collect_accesses_data* data = (struct collect_accesses_data*) user;
+
+  array_id = isl_map_get_tuple_id(m, isl_dim_out);
+  array_index = id_list_index_of(data->id_list, array_id);
+  if (array_index == -1) {
+    array_index = isl_id_list_n_id(data->id_list);
+    data->id_list = isl_id_list_add(data->id_list, array_id);
+  } else {
+    isl_id_free(array_id);
+  }
+
+  relation = isl_union_map_to_osl_relation(isl_union_map_from_map(m));
+  osl_relation_insert_blank_column(relation, 1);
+  osl_relation_insert_blank_row(relation, 0);
+  relation->nb_output_dims += 1;
+  osl_int_set_si(relation->precision, &relation->m[0][1], -1);
+  osl_int_set_si(relation->precision, &relation->m[0][relation->nb_columns - 1], array_index + 1);
+  node = osl_relation_list_node(relation);
+  osl_relation_list_add(&data->stmt->access, node);
+  return isl_stat_ok;
+}
+
+struct collect_stmts_data {
+  isl_union_map* schedule_map;
+  isl_union_map* access;
+  osl_scop_p scop;
+  isl_id_list* array_ids;
+};
+
+static isl_stat collect_stmts(__isl_take isl_set* s, void* user) {
+  isl_space *space;
+  isl_map *domain_map;
+  isl_union_map *umap;
+  osl_statement_p stmt;
+  struct collect_stmts_data* data = (struct collect_stmts_data*) user;
+  struct collect_accesses_data access_data;
+  osl_scop_p scop = data->scop;
+
+  stmt = osl_statement_malloc();
+  osl_statement_add(&scop->statement, stmt);
+
+  space = isl_set_get_space(s);
+  space = isl_space_params(space);
+  domain_map = isl_map_from_domain_and_range(isl_set_empty(isl_space_copy(space)), isl_set_copy(s));
+  stmt->domain = isl_union_map_to_osl_relation(isl_union_map_from_map(domain_map));
+
+  umap = isl_union_map_intersect_domain(isl_union_map_copy(data->schedule_map),
+                                        isl_union_set_from_set(isl_set_copy(s)));
+  stmt->scattering = isl_union_map_to_osl_relation(umap);
+
+  umap = isl_union_map_intersect_domain(isl_union_map_copy(data->access),
+                                        isl_union_set_from_set(isl_set_copy(s)));
+  umap = isl_union_map_gist(umap,
+      isl_union_map_from_domain_and_range(isl_union_set_empty(space), isl_union_set_from_set(s)));
+
+  access_data.scop = scop;
+  access_data.stmt = stmt;
+  access_data.id_list = data->array_ids;
+  isl_union_map_foreach_map(umap, &collect_accesses, &access_data);
+  isl_union_map_free(umap);
+  return isl_stat_ok;
+}
+
+osl_scop_p isl_to_osl_scop(__isl_take isl_union_set* context, __isl_take isl_union_set* domain, __isl_take isl_union_map* schedule_map,
+    __isl_take isl_union_map* access) {
+  osl_scop_p scop;
+  isl_union_set *empty_set;
+  isl_union_map *umap;
+  isl_space *space;
+  isl_ctx* ctx;
+  isl_id_list* array_ids;
+  int n_arrays_estimate, i, n;
+  osl_arrays_p arrays;
+
+  ctx = isl_union_set_get_ctx(context);
+  space = isl_union_set_get_space(context);
+  empty_set = isl_union_set_empty(space);
+
+  scop = osl_scop_malloc();
+  umap = isl_union_map_from_domain_and_range(isl_union_set_copy(empty_set), context);
+  scop->context = isl_union_map_to_osl_relation(umap);
+
+  n_arrays_estimate = isl_union_map_n_map(access) / isl_union_set_n_set(domain) + 1;
+  array_ids = isl_id_list_alloc(ctx, n_arrays_estimate);
+
+  struct collect_stmts_data collect_data = { schedule_map, access, scop, array_ids };
+  isl_union_set_foreach_set(domain, &collect_stmts, &collect_data);
+
+  arrays = osl_arrays_malloc();
+  n = isl_id_list_n_id(array_ids);
+  for (i = 0; i < n; ++i) {
+    isl_id* id = isl_id_list_get_id(array_ids, i);
+    osl_arrays_add(arrays, i + 1, (char *) isl_id_get_name(id));
+    isl_id_free(id);
+  }
+  isl_id_list_free(array_ids);
+  osl_generic_add(&scop->extension, osl_generic_shell(arrays, osl_arrays_interface()));
+  return scop;
+}
